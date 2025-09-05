@@ -22,13 +22,22 @@ window.connectWebSocket = function () {
 
 	socket.onmessage = async (event) => {
 		const data = JSON.parse(event.data);
+		console.log('Client received WebSocket message:', data);
 		switch (data.type) {
 			case 'audio': // ai's response
 				printSpeach(data.text, 'ai'); // displays text
 				queueSound(data.audio, setStatus); // plays audio
 				break;
 			case 'text': // user's transcribed speech
-				printSpeach(data.text, 'user'); // displays user text
+				if (data.interim) {
+					// Show interim results with different styling
+					showInterimTranscript(data.text);
+				} else {
+					// Final transcript - clear interim and show final
+					clearInterimTranscript();
+					printSpeach(data.text, 'user'); // displays final user text
+					showThinkingIndicator(true); // show thinking indicator after final transcript
+				}
 				break;
 			default:
 				console.warn('Unknown WebSocket message type:', data.type);

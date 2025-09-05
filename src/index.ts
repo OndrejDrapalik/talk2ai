@@ -29,7 +29,7 @@ export class MyDurableObject extends DurableObject {
 		});
 		this.deepgramSTT = new DeepgramSTT({
 			apiKey: env.DEEPGRAM,
-			model: 'nova-2', // Deepgram's latest and most accurate model
+			model: 'nova-3-general', // Using nova-3-general as specified in parameters
 			language: 'en-US'
 		});
 	}
@@ -43,7 +43,7 @@ export class MyDurableObject extends DurableObject {
 		const queue = new PQueue({ concurrency: 1 });
 
 		// Initialize Deepgram TTS connection
-		const deepgramConnected = await this.deepgramTTS.connect(
+		const deepgramTTSConnected = await this.deepgramTTS.connect(
 			(audioBase64: string) => {
 				// Audio callback - this will be handled in the queue processing
 			},
@@ -52,10 +52,107 @@ export class MyDurableObject extends DurableObject {
 			}
 		);
 
-		if (!deepgramConnected) {
+		if (!deepgramTTSConnected) {
 			console.error('Failed to connect to Deepgram TTS');
 		} else {
 			console.log('Deepgram TTS connected successfully');
+		}
+
+		// Initialize Deepgram STT WebSocket connection
+		const deepgramSTTConnected = await this.deepgramSTT.connect(
+			async (transcript: string, isFinal: boolean) => {
+				console.log('>>', transcript, isFinal ? '(final)' : '(interim)');
+				
+				// Send interim results to client immediately for better UX
+				const message = { 
+					type: 'text', 
+					text: transcript, 
+					interim: !isFinal 
+				};
+				console.log('Sending text message to client:', message);
+				ws.send(JSON.stringify(message));
+
+				// Only process final transcripts for LLM inference
+				if (isFinal && transcript.trim()) {
+					this.msgHistory.push({ role: 'user', content: transcript });
+
+					// run inference
+					const result = streamText({
+						model: workersai('@cf/meta/llama-4-scout-17b-16e-instruct' as any),
+						system:
+							'You are a helpful AI assistant in a voice conversation with the user. Keep your responses conversational and concise. Do not identify yourself as any specific company or brand.',
+						messages: this.msgHistory as any,
+						// experimental_transform: smoothStream(),
+					});
+					
+					// buffer streamed response into sentences, then convert to audio
+					await bufferText(result.textStream, async (sentence: string) => {
+						this.msgHistory.push({ role: 'assistant', content: sentence });
+						console.log('<<', sentence);
+						await queue.add(async () => {
+							try {
+								// Use the DeepgramTTS class for TTS
+								console.log('Synthesizing with DeepgramTTS:', sentence);
+								
+								// Set up a promise to capture the audio result
+								let audioResult: string | null = null;
+								let errorResult: Error | null = null;
+								
+								// Temporarily override the callback to capture this specific result
+								const originalCallback = this.deepgramTTS['onAudioCallback'];
+								const originalErrorCallback = this.deepgramTTS['onErrorCallback'];
+								
+								this.deepgramTTS['onAudioCallback'] = (audioBase64: string) => {
+									audioResult = audioBase64;
+								};
+								
+								this.deepgramTTS['onErrorCallback'] = (error: Error) => {
+									errorResult = error;
+								};
+								
+								// Synthesize the text
+								await this.deepgramTTS.synthesize(sentence);
+								
+								// Wait for the result (with timeout)
+								const timeout = 10000; // 10 seconds
+								const startTime = Date.now();
+								while (!audioResult && !errorResult && (Date.now() - startTime) < timeout) {
+									await new Promise(resolve => setTimeout(resolve, 100));
+								}
+								
+								// Restore original callbacks
+								this.deepgramTTS['onAudioCallback'] = originalCallback;
+								this.deepgramTTS['onErrorCallback'] = originalErrorCallback;
+								
+								if (errorResult) {
+									throw errorResult;
+								}
+								
+								if (!audioResult) {
+									throw new Error('TTS timeout - no audio received');
+								}
+								
+								console.log('Deepgram TTS successful, audio length:', (audioResult as string)?.length || 'unknown');
+								ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audioResult }));
+								
+							} catch (error) {
+								console.error('Deepgram TTS failed:', error instanceof Error ? error.message : error);
+								// For now, just send the text without audio
+								ws.send(JSON.stringify({ type: 'text', text: `[TTS Error] ${sentence}` }));
+							}
+						});
+					});
+				}
+			},
+			(error: Error) => {
+				console.error('Deepgram STT error:', error);
+			}
+		);
+
+		if (!deepgramSTTConnected) {
+			console.error('Failed to connect to Deepgram STT');
+		} else {
+			console.log('Deepgram STT connected successfully');
 		}
 
 		ws.addEventListener('message', async (event) => {
@@ -68,82 +165,14 @@ export class MyDurableObject extends DurableObject {
 				return; // end processing here for this event type
 			}
 
-			// transcribe audio buffer to text (stt) using Deepgram
-			const text = await this.deepgramSTT.transcribe(event.data as ArrayBuffer);
-			console.log('>>', text);
-			ws.send(JSON.stringify({ type: 'text', text })); // send transcription to client
-			this.msgHistory.push({ role: 'user', content: text });
-
-			// run inference
-			const result = streamText({
-				model: workersai('@cf/meta/llama-4-scout-17b-16e-instruct' as any),
-				system:
-					'You are a helpful AI assistant in a voice conversation with the user. Keep your responses conversational and concise. Do not identify yourself as any specific company or brand.',
-				messages: this.msgHistory as any,
-				// experimental_transform: smoothStream(),
-			});
-			// buffer streamed response into sentences, then convert to audio
-			await bufferText(result.textStream, async (sentence: string) => {
-				this.msgHistory.push({ role: 'assistant', content: sentence });
-				console.log('<<', sentence);
-				await queue.add(async () => {
-					try {
-						// Use the DeepgramTTS class for TTS
-						console.log('Synthesizing with DeepgramTTS:', sentence);
-						
-						// Set up a promise to capture the audio result
-						let audioResult: string | null = null;
-						let errorResult: Error | null = null;
-						
-						// Temporarily override the callback to capture this specific result
-						const originalCallback = this.deepgramTTS['onAudioCallback'];
-						const originalErrorCallback = this.deepgramTTS['onErrorCallback'];
-						
-						this.deepgramTTS['onAudioCallback'] = (audioBase64: string) => {
-							audioResult = audioBase64;
-						};
-						
-						this.deepgramTTS['onErrorCallback'] = (error: Error) => {
-							errorResult = error;
-						};
-						
-						// Synthesize the text
-						await this.deepgramTTS.synthesize(sentence);
-						
-						// Wait for the result (with timeout)
-						const timeout = 10000; // 10 seconds
-						const startTime = Date.now();
-						while (!audioResult && !errorResult && (Date.now() - startTime) < timeout) {
-							await new Promise(resolve => setTimeout(resolve, 100));
-						}
-						
-						// Restore original callbacks
-						this.deepgramTTS['onAudioCallback'] = originalCallback;
-						this.deepgramTTS['onErrorCallback'] = originalErrorCallback;
-						
-						if (errorResult) {
-							throw errorResult;
-						}
-						
-						if (!audioResult) {
-							throw new Error('TTS timeout - no audio received');
-						}
-						
-						console.log('Deepgram TTS successful, audio length:', (audioResult as string)?.length || 'unknown');
-						ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audioResult }));
-						
-					} catch (error) {
-						console.error('Deepgram TTS failed:', error instanceof Error ? error.message : error);
-						// For now, just send the text without audio
-						ws.send(JSON.stringify({ type: 'text', text: `[TTS Error] ${sentence}` }));
-					}
-				});
-			});
+			// Send audio directly to Deepgram STT WebSocket for faster processing
+			this.deepgramSTT.sendAudio(event.data as ArrayBuffer);
 		});
 
 		ws.addEventListener('close', (cls) => {
-			// Clean up Deepgram connection
+			// Clean up Deepgram connections
 			this.deepgramTTS.disconnect();
+			this.deepgramSTT.disconnect();
 			ws.close(cls.code, 'Durable Object is closing WebSocket');
 		});
 

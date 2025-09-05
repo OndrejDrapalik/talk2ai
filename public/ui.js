@@ -60,6 +60,37 @@ window.addMessage = function (text, sender) {
 	messagesArea.scrollTop = messagesArea.scrollHeight;
 };
 
+let interimMessageBubble = null;
+
+window.showInterimTranscript = function (text) {
+	if (!text.trim()) return;
+	
+	// Remove existing interim message if any
+	if (interimMessageBubble) {
+		interimMessageBubble.remove();
+		interimMessageBubble = null;
+	}
+	
+	// Create new interim message
+	interimMessageBubble = document.createElement('div');
+	interimMessageBubble.classList.add('message-bubble', 'user-message', 'interim-message');
+	const p = document.createElement('p');
+	p.textContent = text;
+	p.style.opacity = '0.6'; // Make it slightly transparent to show it's interim
+	p.style.fontStyle = 'italic'; // Italicize to differentiate from final
+	interimMessageBubble.appendChild(p);
+	
+	messagesArea.appendChild(interimMessageBubble);
+	messagesArea.scrollTop = messagesArea.scrollHeight;
+};
+
+window.clearInterimTranscript = function () {
+	if (interimMessageBubble) {
+		interimMessageBubble.remove();
+		interimMessageBubble = null;
+	}
+};
+
 window.showThinkingIndicator = function (show) {
 	if (show) {
 		setStatus('Processing...');

@@ -1,4 +1,4 @@
-import { createClient } from '@deepgram/sdk';
+import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 
 export interface DeepgramTTSConfig {
 	apiKey: string;
@@ -34,10 +34,7 @@ export class DeepgramTTS {
 		this.client = createClient(this.apiKey);
 	}
 
-	async connect(
-		onAudio: (audioBase64: string) => void,
-		onError?: (error: Error) => void,
-	): Promise<boolean> {
+	async connect(onAudio: (audioBase64: string) => void, onError?: (error: Error) => void): Promise<boolean> {
 		try {
 			this.onAudioCallback = onAudio;
 			this.onErrorCallback = onError;
@@ -119,23 +116,23 @@ export class DeepgramTTS {
 						sample_rate: this.config.sampleRate,
 					}
 				);
-				
+
 				console.log('Deepgram TTS result type:', typeof result);
 				console.log('Deepgram TTS result keys:', result ? Object.keys(result) : 'null');
-				
+
 				// The Deepgram SDK returns an object with a result property that contains the actual response
 				let audioBase64: string | null = null;
 				let actualResult = result;
-				
+
 				// Check if the result has a result property (SDK wrapper)
 				if (result && result.result) {
 					console.log('Found result.result, using that as actual result');
 					actualResult = result.result;
 				}
-				
+
 				console.log('Actual result type:', typeof actualResult);
 				console.log('Actual result keys:', actualResult && typeof actualResult === 'object' ? Object.keys(actualResult) : 'not an object');
-				
+
 				if (actualResult instanceof ArrayBuffer) {
 					// Convert ArrayBuffer to base64
 					console.log('Processing ArrayBuffer result');
@@ -154,7 +151,7 @@ export class DeepgramTTS {
 					const reader = actualResult.getReader();
 					const chunks: Uint8Array[] = [];
 					let done = false;
-					
+
 					while (!done) {
 						const { value, done: streamDone } = await reader.read();
 						done = streamDone;
@@ -162,7 +159,7 @@ export class DeepgramTTS {
 							chunks.push(value);
 						}
 					}
-					
+
 					// Combine chunks into a single ArrayBuffer
 					const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
 					const combinedArray = new Uint8Array(totalLength);
@@ -171,7 +168,7 @@ export class DeepgramTTS {
 						combinedArray.set(chunk, offset);
 						offset += chunk.length;
 					}
-					
+
 					audioBase64 = this.arrayBufferToBase64(combinedArray.buffer);
 				} else if (actualResult && actualResult.arrayBuffer) {
 					// If it's a Response object, get the arrayBuffer
@@ -179,9 +176,9 @@ export class DeepgramTTS {
 					const buffer = await actualResult.arrayBuffer();
 					audioBase64 = this.arrayBufferToBase64(buffer);
 				}
-				
+
 				console.log('Processed audio base64 length:', audioBase64?.length || 'no audio processed');
-				
+
 				if (audioBase64 && this.onAudioCallback) {
 					console.log('Calling audio callback with base64 audio');
 					this.onAudioCallback(audioBase64);
@@ -237,29 +234,198 @@ export class DeepgramTTS {
 export class DeepgramSTT {
 	private client: any;
 	private config: DeepgramSTTConfig;
+	private connection: any;
+	private isConnected: boolean = false;
+	private isReconnecting: boolean = false;
+	private onTranscriptCallback?: (transcript: string, isFinal: boolean) => void;
+	private onErrorCallback?: (error: Error) => void;
 
 	constructor(config: DeepgramSTTConfig) {
 		this.config = {
-			model: 'nova-2',
+			model: 'nova-3-general',
 			language: 'en-US',
 			...config,
 		};
 		this.client = createClient(this.config.apiKey);
 	}
 
+	async connect(onTranscript: (transcript: string, isFinal: boolean) => void, onError?: (error: Error) => void): Promise<boolean> {
+		try {
+			this.onTranscriptCallback = onTranscript;
+			this.onErrorCallback = onError;
+
+			console.log('Connecting to Deepgram STT WebSocket...');
+			
+			// Create WebSocket connection using Deepgram SDK
+			this.connection = this.client.listen.live({
+				model: this.config.model,
+				language: this.config.language,
+				punctuate: true,
+				smart_format: true,
+				interim_results: true,
+				vad_events: true,
+				encoding: 'linear16',
+				sample_rate: 16000,
+				channels: 1,
+			});
+
+			// Create a promise that resolves when connection opens or rejects on error
+			const connectionPromise = new Promise<boolean>((resolve, reject) => {
+				let resolved = false;
+				
+				const timeout = setTimeout(() => {
+					if (!resolved) {
+						resolved = true;
+						reject(new Error('Connection timeout'));
+					}
+				}, 5000);
+
+				this.connection.on(LiveTranscriptionEvents.Open, () => {
+					if (!resolved) {
+						resolved = true;
+						clearTimeout(timeout);
+						console.log('Deepgram STT connection opened');
+						this.isConnected = true;
+						resolve(true);
+					}
+				});
+
+				this.connection.on(LiveTranscriptionEvents.Error, (error: any) => {
+					if (!resolved) {
+						resolved = true;
+						clearTimeout(timeout);
+						console.error('Deepgram STT connection error:', error);
+						reject(new Error(`Deepgram STT error: ${error.message || error}`));
+					}
+				});
+			});
+
+			// Set up other event handlers
+			this.connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+				console.log('Deepgram STT transcript received:', data);
+				
+				// Extract transcript from the response
+				const transcript = data?.channel?.alternatives?.[0]?.transcript || '';
+				const isFinal = data?.is_final || false;
+				
+				if (transcript && this.onTranscriptCallback) {
+					this.onTranscriptCallback(transcript, isFinal);
+				}
+			});
+
+			this.connection.on(LiveTranscriptionEvents.Close, () => {
+				console.log('Deepgram STT connection closed, attempting to reconnect...');
+				this.isConnected = false;
+				// Automatically reconnect after a short delay
+				setTimeout(() => {
+					if (this.onTranscriptCallback) {
+						this.connect(this.onTranscriptCallback, this.onErrorCallback);
+					}
+				}, 100);
+			});
+
+			this.connection.on(LiveTranscriptionEvents.Error, (error: any) => {
+				console.error('Deepgram STT error:', error);
+				if (this.onErrorCallback) {
+					this.onErrorCallback(new Error(`Deepgram STT error: ${error.message || error}`));
+				}
+			});
+
+			// Add additional event listeners for debugging
+			this.connection.on(LiveTranscriptionEvents.Metadata, (metadata: any) => {
+				console.log('Deepgram STT metadata:', metadata);
+			});
+
+			// Wait for connection to establish
+			return await connectionPromise;
+		} catch (error) {
+			console.error('Failed to connect to Deepgram STT:', error);
+			if (this.onErrorCallback) {
+				this.onErrorCallback(error as Error);
+			}
+			return false;
+		}
+	}
+
+	sendAudio(audioBuffer: ArrayBuffer): void {
+		if (!this.isConnected || !this.connection) {
+			console.warn('Deepgram STT connection not established, attempting to reconnect and queue audio...');
+			// Try to reconnect if we have the callback
+			if (this.onTranscriptCallback && !this.isReconnecting) {
+				this.isReconnecting = true;
+				this.connect(this.onTranscriptCallback, this.onErrorCallback).then((connected) => {
+					this.isReconnecting = false;
+					if (connected) {
+						// Retry sending the audio after successful reconnection
+						this.sendAudio(audioBuffer);
+					}
+				});
+			}
+			return;
+		}
+
+		try {
+			console.log('Sending audio to Deepgram STT, buffer size:', audioBuffer.byteLength);
+			this.connection.send(audioBuffer);
+		} catch (error) {
+			console.error('Error sending audio to Deepgram STT:', error);
+			if (this.onErrorCallback) {
+				this.onErrorCallback(error as Error);
+			}
+		}
+	}
+
+	disconnect(): void {
+		if (this.connection) {
+			try {
+				this.connection.finish();
+			} catch (error) {
+				console.error('Error closing Deepgram STT connection:', error);
+			}
+			this.connection = null;
+		}
+		this.isConnected = false;
+	}
+
+	// Keep the old method for backward compatibility, but mark as deprecated
 	async transcribe(audioBuffer: ArrayBuffer): Promise<string> {
+		console.warn('DeepgramSTT.transcribe() is deprecated. Use WebSocket connection with connect() and sendAudio() instead.');
+		
 		try {
 			console.log('Transcribing audio with Deepgram STT, buffer size:', audioBuffer.byteLength);
-			
-			// Use direct REST API instead of SDK to avoid "Unknown transcription source type" error
-			const response = await fetch(`https://api.deepgram.com/v1/listen?model=${this.config.model}&language=${this.config.language}&smart_format=true&punctuate=true`, {
-				method: 'POST',
-				headers: {
-					'Authorization': `Token ${this.config.apiKey}`,
-					'Content-Type': 'audio/wav',
-				},
-				body: audioBuffer,
+
+			// Build the URL with all the requested parameters
+			const params = new URLSearchParams({
+				model: 'nova-3-general',
+				punctuate: 'true',
+				smart_format: 'true',
+				dictation: 'false',
+				diarize: 'false',
+				numerals: 'false',
+				no_delay: 'true',
+				interim_results: 'true',
+				encoding: 'linear16',
+				vad_events: 'true',
+				sample_rate: '16000',
+				channels: '1',
+				endpointing: '25',
+				filler_words: 'false',
+				profanity_filter: 'false',
+				language: 'en-US'
 			});
+
+			// Use direct REST API instead of SDK to avoid "Unknown transcription source type" error
+			const response = await fetch(
+				`https://api.deepgram.com/v1/listen?${params.toString()}`,
+				{
+					method: 'POST',
+					headers: {
+						Authorization: `Token ${this.config.apiKey}`,
+						'Content-Type': 'audio/wav',
+					},
+					body: audioBuffer,
+				}
+			);
 
 			if (!response.ok) {
 				throw new Error(`Deepgram API error: ${response.status} ${response.statusText}`);
@@ -271,7 +437,7 @@ export class DeepgramSTT {
 			// Extract the transcript from the result
 			const transcript = (result as any)?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
 			console.log('Extracted transcript:', transcript);
-			
+
 			return transcript;
 		} catch (error) {
 			console.error('Error with Deepgram STT:', error);
