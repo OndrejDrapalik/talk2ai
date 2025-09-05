@@ -14,8 +14,10 @@
 		"wrangler": "^4.2.0"
 	},
 	"dependencies": {
+		"@deepgram/sdk": "^4.11.2",
 		"ai": "^4.2.0",
 		"p-queue": "^8.1.0",
-		"workers-ai-provider": "^0.2.0"
+		"workers-ai-provider": "^0.2.0",
+		"zod": "^4.1.5"
 	}
 }

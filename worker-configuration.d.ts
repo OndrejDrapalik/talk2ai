@@ -5,6 +5,7 @@ declare namespace Cloudflare {
 		MY_DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").MyDurableObject>;
 		AI: Ai;
 		ASSETS: Fetcher;
+		DEEPGRAM: string;
 	}
 }
 interface Env extends Cloudflare.Env {}

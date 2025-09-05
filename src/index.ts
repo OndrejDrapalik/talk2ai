@@ -21,7 +21,7 @@ export class MyDurableObject extends DurableObject {
 		this.env = env;
 		this.msgHistory = [];
 	}
-	async fetch(request: any) {
+	async fetch(_request: any) {
 		// set up ws pipeline
 		const webSocketPair = new WebSocketPair();
 		const [socket, ws] = Object.values(webSocketPair);
@@ -29,6 +29,9 @@ export class MyDurableObject extends DurableObject {
 		ws.accept();
 		const workersai = createWorkersAI({ binding: this.env.AI });
 		const queue = new PQueue({ concurrency: 1 });
+		
+		// Temporarily disable Deepgram initialization to fix connection issues
+		console.log('Deepgram TTS temporarily disabled - using Cloudflare TTS');
 
 		ws.addEventListener('message', async (event) => {
 			// handle chat commands
@@ -51,7 +54,7 @@ export class MyDurableObject extends DurableObject {
 			// run inference
 			const result = streamText({
 				model: workersai('@cf/meta/llama-4-scout-17b-16e-instruct' as any),
-				system: 'You in a voice conversation with the user',
+				system: 'You are a helpful AI assistant in a voice conversation with the user. Keep your responses conversational and concise. Do not identify yourself as any specific company or brand.',
 				messages: this.msgHistory as any,
 				// experimental_transform: smoothStream(),
 			});
@@ -60,12 +63,45 @@ export class MyDurableObject extends DurableObject {
 				this.msgHistory.push({ role: 'assistant', content: sentence });
 				console.log('<<', sentence);
 				await queue.add(async () => {
-					// convert response to audio (tts)
-					const audio = await this.env.AI.run('@cf/myshell-ai/melotts' as any, {
-						prompt: sentence,
-						// lang: 'es'
-					});
-					ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audio.audio }));
+					// Try Deepgram TTS with timeout fallback
+					console.log('Attempting Deepgram TTS for sentence:', sentence);
+					try {
+						const deepgramResponse = await Promise.race([
+							fetch('https://api.deepgram.com/v1/speak?model=aura-2-zeus-en&encoding=linear16&sample_rate=24000', {
+								method: 'POST',
+								headers: {
+									'Authorization': `Token ${this.env.DEEPGRAM}`,
+									'Content-Type': 'application/json',
+								},
+								body: JSON.stringify({
+									text: sentence,
+								}),
+							}),
+							new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+						]) as Response;
+
+						if (deepgramResponse.ok) {
+							const audioBuffer = await deepgramResponse.arrayBuffer();
+							// Convert ArrayBuffer to base64 safely to avoid call stack overflow
+							const uint8Array = new Uint8Array(audioBuffer);
+							let binary = '';
+							for (let i = 0; i < uint8Array.length; i++) {
+								binary += String.fromCharCode(uint8Array[i]);
+							}
+							const audioBase64 = btoa(binary);
+							console.log('Deepgram TTS successful, audio length:', audioBase64.length);
+							ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audioBase64 }));
+						} else {
+							throw new Error(`Deepgram API error: ${deepgramResponse.status}`);
+						}
+					} catch (error) {
+						console.log('Deepgram failed, using Cloudflare fallback:', error instanceof Error ? error.message : error);
+						// Fallback to Cloudflare TTS
+						const audio = await this.env.AI.run('@cf/myshell-ai/melotts' as any, {
+							prompt: sentence,
+						});
+						ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audio.audio }));
+					}
 				});
 			});
 		});
@@ -79,7 +115,7 @@ export class MyDurableObject extends DurableObject {
 }
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
+	async fetch(request, env, _ctx): Promise<Response> {
 		if (request.url.endsWith('/websocket')) {
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {

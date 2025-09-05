@@ -11,27 +11,27 @@
 	"migrations": [
 		{
 			"new_classes": ["MyDurableObject"],
-			"tag": "v1",
-		},
+			"tag": "v1"
+		}
 	],
 	"assets": {
 		"binding": "ASSETS",
-		"directory": "./public",
+		"directory": "./public"
 	},
 	"durable_objects": {
 		"bindings": [
 			{
 				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT",
-			},
-		],
+				"name": "MY_DURABLE_OBJECT"
+			}
+		]
 	},
 	"observability": {
-		"enabled": true,
+		"enabled": true
 	},
 	"ai": {
-		"binding": "AI",
-	},
+		"binding": "AI"
+	}
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
