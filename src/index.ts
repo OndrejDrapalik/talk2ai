@@ -3,6 +3,7 @@ import { bufferText } from './utils';
 import { DurableObject } from 'cloudflare:workers';
 import { createWorkersAI } from 'workers-ai-provider';
 import PQueue from 'p-queue';
+import { DeepgramTTS, DeepgramSTT } from './deepgram-tts';
 
 /* Todo
  * ✅ 1. WS with frontend
@@ -16,10 +17,21 @@ import PQueue from 'p-queue';
 export class MyDurableObject extends DurableObject {
 	env: Env;
 	msgHistory: Array<Object>;
+	deepgramTTS: DeepgramTTS;
+	deepgramSTT: DeepgramSTT;
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.env = env;
 		this.msgHistory = [];
+		this.deepgramTTS = new DeepgramTTS({
+			apiKey: env.DEEPGRAM,
+			model: 'aura-arcas-en' // male voice as mentioned in CLAUDE.md
+		});
+		this.deepgramSTT = new DeepgramSTT({
+			apiKey: env.DEEPGRAM,
+			model: 'nova-2', // Deepgram's latest and most accurate model
+			language: 'en-US'
+		});
 	}
 	async fetch(_request: any) {
 		// set up ws pipeline
@@ -29,9 +41,22 @@ export class MyDurableObject extends DurableObject {
 		ws.accept();
 		const workersai = createWorkersAI({ binding: this.env.AI });
 		const queue = new PQueue({ concurrency: 1 });
-		
-		// Temporarily disable Deepgram initialization to fix connection issues
-		console.log('Deepgram TTS temporarily disabled - using Cloudflare TTS');
+
+		// Initialize Deepgram TTS connection
+		const deepgramConnected = await this.deepgramTTS.connect(
+			(audioBase64: string) => {
+				// Audio callback - this will be handled in the queue processing
+			},
+			(error: Error) => {
+				console.error('Deepgram TTS error:', error);
+			}
+		);
+
+		if (!deepgramConnected) {
+			console.error('Failed to connect to Deepgram TTS');
+		} else {
+			console.log('Deepgram TTS connected successfully');
+		}
 
 		ws.addEventListener('message', async (event) => {
 			// handle chat commands
@@ -43,10 +68,8 @@ export class MyDurableObject extends DurableObject {
 				return; // end processing here for this event type
 			}
 
-			// transcribe audio buffer to text (stt)
-			const { text } = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-				audio: [...new Uint8Array(event.data as ArrayBuffer)],
-			});
+			// transcribe audio buffer to text (stt) using Deepgram
+			const text = await this.deepgramSTT.transcribe(event.data as ArrayBuffer);
 			console.log('>>', text);
 			ws.send(JSON.stringify({ type: 'text', text })); // send transcription to client
 			this.msgHistory.push({ role: 'user', content: text });
@@ -54,7 +77,8 @@ export class MyDurableObject extends DurableObject {
 			// run inference
 			const result = streamText({
 				model: workersai('@cf/meta/llama-4-scout-17b-16e-instruct' as any),
-				system: 'You are a helpful AI assistant in a voice conversation with the user. Keep your responses conversational and concise. Do not identify yourself as any specific company or brand.',
+				system:
+					'You are a helpful AI assistant in a voice conversation with the user. Keep your responses conversational and concise. Do not identify yourself as any specific company or brand.',
 				messages: this.msgHistory as any,
 				// experimental_transform: smoothStream(),
 			});
@@ -63,50 +87,63 @@ export class MyDurableObject extends DurableObject {
 				this.msgHistory.push({ role: 'assistant', content: sentence });
 				console.log('<<', sentence);
 				await queue.add(async () => {
-					// Try Deepgram TTS with timeout fallback
-					console.log('Attempting Deepgram TTS for sentence:', sentence);
 					try {
-						const deepgramResponse = await Promise.race([
-							fetch('https://api.deepgram.com/v1/speak?model=aura-2-zeus-en&encoding=linear16&sample_rate=24000', {
-								method: 'POST',
-								headers: {
-									'Authorization': `Token ${this.env.DEEPGRAM}`,
-									'Content-Type': 'application/json',
-								},
-								body: JSON.stringify({
-									text: sentence,
-								}),
-							}),
-							new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
-						]) as Response;
-
-						if (deepgramResponse.ok) {
-							const audioBuffer = await deepgramResponse.arrayBuffer();
-							// Convert ArrayBuffer to base64 safely to avoid call stack overflow
-							const uint8Array = new Uint8Array(audioBuffer);
-							let binary = '';
-							for (let i = 0; i < uint8Array.length; i++) {
-								binary += String.fromCharCode(uint8Array[i]);
-							}
-							const audioBase64 = btoa(binary);
-							console.log('Deepgram TTS successful, audio length:', audioBase64.length);
-							ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audioBase64 }));
-						} else {
-							throw new Error(`Deepgram API error: ${deepgramResponse.status}`);
+						// Use the DeepgramTTS class for TTS
+						console.log('Synthesizing with DeepgramTTS:', sentence);
+						
+						// Set up a promise to capture the audio result
+						let audioResult: string | null = null;
+						let errorResult: Error | null = null;
+						
+						// Temporarily override the callback to capture this specific result
+						const originalCallback = this.deepgramTTS['onAudioCallback'];
+						const originalErrorCallback = this.deepgramTTS['onErrorCallback'];
+						
+						this.deepgramTTS['onAudioCallback'] = (audioBase64: string) => {
+							audioResult = audioBase64;
+						};
+						
+						this.deepgramTTS['onErrorCallback'] = (error: Error) => {
+							errorResult = error;
+						};
+						
+						// Synthesize the text
+						await this.deepgramTTS.synthesize(sentence);
+						
+						// Wait for the result (with timeout)
+						const timeout = 10000; // 10 seconds
+						const startTime = Date.now();
+						while (!audioResult && !errorResult && (Date.now() - startTime) < timeout) {
+							await new Promise(resolve => setTimeout(resolve, 100));
 						}
+						
+						// Restore original callbacks
+						this.deepgramTTS['onAudioCallback'] = originalCallback;
+						this.deepgramTTS['onErrorCallback'] = originalErrorCallback;
+						
+						if (errorResult) {
+							throw errorResult;
+						}
+						
+						if (!audioResult) {
+							throw new Error('TTS timeout - no audio received');
+						}
+						
+						console.log('Deepgram TTS successful, audio length:', (audioResult as string)?.length || 'unknown');
+						ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audioResult }));
+						
 					} catch (error) {
-						console.log('Deepgram failed, using Cloudflare fallback:', error instanceof Error ? error.message : error);
-						// Fallback to Cloudflare TTS
-						const audio = await this.env.AI.run('@cf/myshell-ai/melotts' as any, {
-							prompt: sentence,
-						});
-						ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audio.audio }));
+						console.error('Deepgram TTS failed:', error instanceof Error ? error.message : error);
+						// For now, just send the text without audio
+						ws.send(JSON.stringify({ type: 'text', text: `[TTS Error] ${sentence}` }));
 					}
 				});
 			});
 		});
 
 		ws.addEventListener('close', (cls) => {
+			// Clean up Deepgram connection
+			this.deepgramTTS.disconnect();
 			ws.close(cls.code, 'Durable Object is closing WebSocket');
 		});
 

@@ -7,6 +7,12 @@ export interface DeepgramTTSConfig {
 	sampleRate?: number;
 }
 
+export interface DeepgramSTTConfig {
+	apiKey: string;
+	model?: string;
+	language?: string;
+}
+
 export class DeepgramTTS {
 	private client: any;
 	private connection: any;
@@ -114,15 +120,73 @@ export class DeepgramTTS {
 					}
 				);
 				
-				console.log('Deepgram TTS result received, audio length:', result?.audio?.length || 'no audio');
+				console.log('Deepgram TTS result type:', typeof result);
+				console.log('Deepgram TTS result keys:', result ? Object.keys(result) : 'null');
 				
-				// Convert result to base64 and call callback
-				if (result && result.audio && this.onAudioCallback) {
+				// The Deepgram SDK returns an object with a result property that contains the actual response
+				let audioBase64: string | null = null;
+				let actualResult = result;
+				
+				// Check if the result has a result property (SDK wrapper)
+				if (result && result.result) {
+					console.log('Found result.result, using that as actual result');
+					actualResult = result.result;
+				}
+				
+				console.log('Actual result type:', typeof actualResult);
+				console.log('Actual result keys:', actualResult && typeof actualResult === 'object' ? Object.keys(actualResult) : 'not an object');
+				
+				if (actualResult instanceof ArrayBuffer) {
+					// Convert ArrayBuffer to base64
+					console.log('Processing ArrayBuffer result');
+					audioBase64 = this.arrayBufferToBase64(actualResult);
+				} else if (actualResult && typeof actualResult === 'object' && actualResult.audio) {
+					// If it has an audio property, use that
+					console.log('Found audio property in result');
+					if (actualResult.audio instanceof ArrayBuffer) {
+						audioBase64 = this.arrayBufferToBase64(actualResult.audio);
+					} else if (typeof actualResult.audio === 'string') {
+						audioBase64 = actualResult.audio;
+					}
+				} else if (actualResult && actualResult.getReader) {
+					// If it's a ReadableStream, read it
+					console.log('Processing ReadableStream result');
+					const reader = actualResult.getReader();
+					const chunks: Uint8Array[] = [];
+					let done = false;
+					
+					while (!done) {
+						const { value, done: streamDone } = await reader.read();
+						done = streamDone;
+						if (value) {
+							chunks.push(value);
+						}
+					}
+					
+					// Combine chunks into a single ArrayBuffer
+					const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+					const combinedArray = new Uint8Array(totalLength);
+					let offset = 0;
+					for (const chunk of chunks) {
+						combinedArray.set(chunk, offset);
+						offset += chunk.length;
+					}
+					
+					audioBase64 = this.arrayBufferToBase64(combinedArray.buffer);
+				} else if (actualResult && actualResult.arrayBuffer) {
+					// If it's a Response object, get the arrayBuffer
+					console.log('Processing Response object with arrayBuffer method');
+					const buffer = await actualResult.arrayBuffer();
+					audioBase64 = this.arrayBufferToBase64(buffer);
+				}
+				
+				console.log('Processed audio base64 length:', audioBase64?.length || 'no audio processed');
+				
+				if (audioBase64 && this.onAudioCallback) {
 					console.log('Calling audio callback with base64 audio');
-					// The result.audio should already be in base64 format
-					this.onAudioCallback(result.audio);
+					this.onAudioCallback(audioBase64);
 				} else {
-					console.error('No audio data received from Deepgram or no callback');
+					console.error('No audio data processed from Deepgram response or no callback');
 				}
 			} catch (error) {
 				console.error('Error with Deepgram REST TTS:', error);
@@ -167,5 +231,51 @@ export class DeepgramTTS {
 			binary += String.fromCharCode(bytes[i]);
 		}
 		return btoa(binary);
+	}
+}
+
+export class DeepgramSTT {
+	private client: any;
+	private config: DeepgramSTTConfig;
+
+	constructor(config: DeepgramSTTConfig) {
+		this.config = {
+			model: 'nova-2',
+			language: 'en-US',
+			...config,
+		};
+		this.client = createClient(this.config.apiKey);
+	}
+
+	async transcribe(audioBuffer: ArrayBuffer): Promise<string> {
+		try {
+			console.log('Transcribing audio with Deepgram STT, buffer size:', audioBuffer.byteLength);
+			
+			// Use direct REST API instead of SDK to avoid "Unknown transcription source type" error
+			const response = await fetch(`https://api.deepgram.com/v1/listen?model=${this.config.model}&language=${this.config.language}&smart_format=true&punctuate=true`, {
+				method: 'POST',
+				headers: {
+					'Authorization': `Token ${this.config.apiKey}`,
+					'Content-Type': 'audio/wav',
+				},
+				body: audioBuffer,
+			});
+
+			if (!response.ok) {
+				throw new Error(`Deepgram API error: ${response.status} ${response.statusText}`);
+			}
+
+			const result = await response.json();
+			console.log('Deepgram STT result:', result);
+
+			// Extract the transcript from the result
+			const transcript = (result as any)?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
+			console.log('Extracted transcript:', transcript);
+			
+			return transcript;
+		} catch (error) {
+			console.error('Error with Deepgram STT:', error);
+			throw error;
+		}
 	}
 }
